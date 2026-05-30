@@ -1,0 +1,13 @@
+{
+  "name": "fish-multiplayer-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Authoritative WebSocket server for the partnership card game Fish (Literature)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
