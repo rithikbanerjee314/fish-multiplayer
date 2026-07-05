@@ -165,6 +165,7 @@ function publicStateMsg(room) {
     } : null,
     pause: room.pause ? { bySeat: room.pause.bySeat, deadlineAt: room.pause.deadlineAt } : null,
     pendingPass: room.pendingPass ? { seat: room.pendingPass.seat } : null,
+    pendingFinalChooser: room.pendingFinalChooser ? { seat: room.pendingFinalChooser.seat } : null,
     turnDeadlineAt: room.turnDeadlineAt,
     winner: room.winner,
   };
@@ -196,7 +197,7 @@ function clearTimer(room, key) {
 function armTurnTimer(room) {
   clearTimer(room, 'turn');
   room.turnDeadlineAt = null;
-  if (room.status !== 'playing' || room.declaration || room.pause || room.pendingPass) return;
+  if (room.status !== 'playing' || room.declaration || room.pause || room.pendingPass || room.pendingFinalChooser) return;
   if (!room.config.turnTimerSec) return;
   const seat = room.seats[room.turnSeat];
   if (!seat || seat.isBot) return; // bots act on their own schedule
@@ -204,7 +205,7 @@ function armTurnTimer(room) {
   room.timers.turn = setTimeout(() => onTurnTimeout(room), room.config.turnTimerSec * 1000);
 }
 function onTurnTimeout(room) {
-  if (room.status !== 'playing' || room.declaration || room.pause || room.pendingPass) return;
+  if (room.status !== 'playing' || room.declaration || room.pause || room.pendingPass || room.pendingFinalChooser) return;
   const seat = room.turnSeat;
   // Auto-play a valid question for the stalled human (uses non-cheating bot logic).
   const ask = chooseAsk(room, seat, false);
@@ -230,6 +231,7 @@ function makeRoom(playerCount, teamMode, turnTimerSec) {
     declaration: null,
     pause: null,
     pendingPass: null,
+    pendingFinalChooser: null,
     turnDeadlineAt: null,
     endgame: false,
     winner: null,
@@ -387,6 +389,7 @@ function dealAndStart(room) {
   room.lastQuestion = null;
   room.claimed = { 0: [], 1: [] };
   room.declaration = null; room.pause = null; room.pendingPass = null;
+  room.pendingFinalChooser = null;
   room.endgame = false; room.winner = null;
   room.knowledge = freshKnowledge();
 
@@ -443,6 +446,7 @@ function validateAsk(room, askerSeat, targetSeat, cardId) {
   if (room.pause) return 'Game is paused.';
   if (room.declaration) return 'A declaration is in progress.';
   if (room.pendingPass) return 'A teammate must receive the turn first.';
+  if (room.pendingFinalChooser) return 'An opponent must be chosen to declare.';
   if (room.turnSeat !== askerSeat) return 'It is not your turn.';
   if (!validCardSet(room.config.mode).has(cardId)) return 'That card is not in play.';
   const asker = room.seats[askerSeat];
@@ -499,6 +503,7 @@ function handleDeclareStart(ws, msg) {
   const room = rooms.get(meta.code); if (!room || room.status !== 'playing') return;
   if (room.declaration) { sendError(ws, 'DECL_BUSY', 'Another declaration is already in progress.'); return; }
   if (room.pause) { sendError(ws, 'PAUSED', 'Game is paused.'); return; }
+  if (room.pendingFinalChooser) { sendError(ws, 'CHOOSE_FIRST', 'Choose an opponent to declare the remaining sets.'); return; }
   const hsId = msg.hsId;
   if (!allHalfSuits(room.config.mode).includes(hsId)) { sendError(ws, 'BAD_SET', 'Invalid set.'); return; }
   if (room.claimed[0].includes(hsId) || room.claimed[1].includes(hsId)) {
@@ -612,14 +617,20 @@ function teammatesWithCards(room, seat) {
 
 function resumeTurnAfter(room, retSeat) {
   room.pendingPass = null;
+  room.pendingFinalChooser = null;
   const holder = room.seats[retSeat];
   if (holder && holder.hand.length > 0) { room.turnSeat = retSeat; return; }
   // Turn-holder emptied (e.g. by this declaration). Must pass to a teammate.
   const mates = teammatesWithCards(room, retSeat);
-  if (mates.length === 0) { room.turnSeat = retSeat; return; } // whole team empty → endgame handles it
   if (mates.length === 1) { room.turnSeat = mates[0]; return; }
-  room.pendingPass = { seat: retSeat }; // that player chooses
+  if (mates.length > 1) { room.pendingPass = { seat: retSeat }; room.turnSeat = retSeat; return; }
+  // Whole team is out of cards. If the other team still holds cards, that team
+  // must declare every remaining set. Per the rules, the emptied turn-holder
+  // chooses which opponent declares (chooseFinalDeclarer). If both teams are
+  // empty, all sets are claimed and checkEndConditions will finish the game.
   room.turnSeat = retSeat;
+  const otherTeam = 1 - teamOf(retSeat);
+  if (teamCardTotal(room, otherTeam) > 0) room.pendingFinalChooser = { seat: retSeat };
 }
 
 function handlePassTurn(ws, msg) {
@@ -631,6 +642,24 @@ function handlePassTurn(ws, msg) {
     sendError(ws, 'BAD_PASS', 'Pass to a teammate who has cards.'); return;
   }
   room.pendingPass = null;
+  room.turnSeat = to;
+  sendStates(room);
+  armTurnTimer(room);
+  scheduleBotIfNeeded(room);
+}
+
+// Endgame: the emptied team's turn-holder picks an opponent (who still holds
+// cards) to declare out the remaining sets. The chosen seat becomes the turn-
+// holder so their team can declare each leftover half-suit.
+function handleChooseFinalDeclarer(ws, msg) {
+  const meta = sockets.get(ws); if (!meta) return;
+  const room = rooms.get(meta.code); if (!room || !room.pendingFinalChooser) return;
+  if (room.pendingFinalChooser.seat !== meta.seat) return;
+  const to = msg.toSeat;
+  if (typeof to !== 'number' || teamOf(to) === teamOf(meta.seat) || !room.seats[to] || room.seats[to].hand.length === 0) {
+    sendError(ws, 'BAD_CHOICE', 'Choose an opponent who still has cards.'); return;
+  }
+  room.pendingFinalChooser = null;
   room.turnSeat = to;
   sendStates(room);
   armTurnTimer(room);
@@ -676,7 +705,7 @@ function finishGame(room) {
 function handlePause(ws) {
   const meta = sockets.get(ws); if (!meta) return;
   const room = rooms.get(meta.code); if (!room || room.status !== 'playing') return;
-  if (room.pause || room.declaration) return;
+  if (room.pause || room.declaration || room.pendingFinalChooser) return;
   room.pause = { bySeat: meta.seat, deadlineAt: Date.now() + PAUSE_MS };
   clearTimer(room, 'turn'); room.turnDeadlineAt = null;
   room.timers.pause = setTimeout(() => { if (room.pause) doResume(room); }, PAUSE_MS);
@@ -700,7 +729,9 @@ function doResume(room) {
 // Bots
 // ---------------------------------------------------------------------------
 function scheduleBotIfNeeded(room) {
-  if (room.status !== 'playing' || room.pause || room.declaration || room.pendingPass) {
+  if (room.status !== 'playing') return;
+  if (room.pendingFinalChooser) { maybeBotChooseFinal(room); return; }
+  if (room.pause || room.declaration || room.pendingPass) {
     if (room.pendingPass) maybeBotPass(room);
     return;
   }
@@ -731,6 +762,25 @@ function maybeBotPass(room) {
       room.turnSeat = mates[Math.floor(Math.random() * mates.length)];
       sendStates(room); armTurnTimer(room); scheduleBotIfNeeded(room);
     }
+  }, BOT_DELAY_MS);
+}
+
+function maybeBotChooseFinal(room) {
+  const seat = room.pendingFinalChooser.seat;
+  const s = room.seats[seat];
+  if (!s || (!s.isBot && s.connected)) return; // a human chooser acts for themselves
+  if (room.botTimers['final']) return;
+  room.botTimers['final'] = setTimeout(() => {
+    room.botTimers['final'] = null;
+    if (!room.pendingFinalChooser || room.pendingFinalChooser.seat !== seat) return;
+    const opps = [];
+    for (let i = 0; i < room.seats.length; i++) {
+      if (teamOf(i) !== teamOf(seat) && room.seats[i] && room.seats[i].hand.length > 0) opps.push(i);
+    }
+    if (!opps.length) return;
+    room.pendingFinalChooser = null;
+    room.turnSeat = opps[Math.floor(Math.random() * opps.length)];
+    sendStates(room); armTurnTimer(room); scheduleBotIfNeeded(room);
   }, BOT_DELAY_MS);
 }
 
@@ -994,6 +1044,7 @@ const HANDLERS = {
   declareSubmit: handleDeclareSubmit,
   declareCancel: handleDeclareCancel,
   passTurn: handlePassTurn,
+  chooseFinalDeclarer: handleChooseFinalDeclarer,
   pause: handlePause,
   resume: handleResume,
 };

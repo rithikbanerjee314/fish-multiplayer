@@ -69,7 +69,7 @@ Dispatched through the `HANDLERS` table in `server.js`.
 
 **Client → Server (`cmd`)**: `create`, `join`, `reconnect`, `setTeam`,
 `addBot`, `removeBot`, `startGame`, `ask`, `declareStart`, `declareSubmit`,
-`declareCancel`, `passTurn`, `pause`, `resume`.
+`declareCancel`, `passTurn`, `chooseFinalDeclarer`, `pause`, `resume`.
 
 **Server → Client (`type`)**: `created` (code/token/**seat**), `publicState`,
 `privateState` (own hand), `dealt`, `askResult`, `declarationResult` (full
@@ -93,8 +93,12 @@ reveal for animation), `gameOver`, `playerDisconnected`, `error`.
 - A **cardless** player may still declare for their team and cannot be asked or
   receive the turn.
 - **Endgame**: when one team is out of cards, the other team declares out all
-  remaining half-suits (any member); on declaration-timer expiry a turn-based
-  fallback forces a declarer.
+  remaining half-suits (any member). If the turn comes to rest on the now-empty
+  team (its last holder was emptied by a declaration), the server enters a
+  `pendingFinalChooser` state: that seat must `chooseFinalDeclarer {toSeat}` to
+  hand the turn to an opponent who still holds cards, so the card-holding team
+  can declare the rest. Bots/disconnected choosers auto-pick. This prevents the
+  turn from stalling on a cardless seat with sets still unclaimed.
 
 ### Timers (sent as absolute `deadlineAt` ms; clients render drift-free)
 - `DECL_MS = 120000` — 2-minute declaration limit.

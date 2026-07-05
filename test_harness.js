@@ -61,7 +61,13 @@ function maybeAct() {
     if (mate) { send({ cmd: 'passTurn', toSeat: mate.seat }); }
     return;
   }
-  if (pub.declaration || pub.pause || pub.pendingPass) return;
+  // endgame: my team is out — choose an opponent to declare the rest
+  if (pub.pendingFinalChooser && pub.pendingFinalChooser.seat === seat) {
+    const opp = pub.seats.find(s => s.team !== seat % 2 && s.handCount > 0);
+    if (opp) { log('choosing final declarer', opp.seat); send({ cmd: 'chooseFinalDeclarer', toSeat: opp.seat }); }
+    return;
+  }
+  if (pub.declaration || pub.pause || pub.pendingPass || pub.pendingFinalChooser) return;
   if (pub.turnSeat !== seat) return;
   // my turn — small delay to avoid tight loop
   setTimeout(doMyTurn, 30);

@@ -320,6 +320,7 @@ input:focus,select:focus{border-color:var(--gold)}
         <button class="primary" id="askBtn" onclick="openAsk()">Ask</button>
         <button id="declareBtn" onclick="openDeclare()">Declare</button>
         <button id="passBtn" class="hidden" onclick="openPass()">Pass turn</button>
+        <button id="chooseBtn" class="primary hidden" onclick="openChooseFinal()">Choose declarer</button>
       </div>
     </div>
     <div class="hand" id="hand"></div>
@@ -543,6 +544,7 @@ function renderTurnInfo(){
   const tb=document.getElementById('turnBanner'), lq=document.getElementById('lastQ');
   if(p.status==='finished'){ tb.textContent=''; }
   else if(p.pendingPass){ tb.innerHTML = p.pendingPass.seat===S.seat? 'Choose a teammate to take the turn' : seatName(p.pendingPass.seat)+' is passing the turn…'; }
+  else if(p.pendingFinalChooser){ tb.innerHTML = p.pendingFinalChooser.seat===S.seat? '<span style="color:var(--gold2)">Your team is out — choose an opponent to declare</span>' : seatName(p.pendingFinalChooser.seat)+' is choosing who declares the rest…'; }
   else if(p.pause){ tb.innerHTML='Paused by '+seatName(p.pause.bySeat); }
   else if(p.declaration){ tb.innerHTML=seatName(p.declaration.declarerSeat)+' is declaring <b>'+setLabel(p.declaration.hsId)+'</b>'; }
   else if(p.turnSeat===S.seat){ tb.innerHTML='<span style="color:var(--gold2)">Your turn</span>'; }
@@ -557,15 +559,19 @@ function renderTurnInfo(){
 
 function renderActionButtons(){
   const p=S.pub, playing=p.status==='playing';
-  const myTurn=playing&&p.turnSeat===S.seat&&!p.declaration&&!p.pause&&!p.pendingPass;
+  const myTurn=playing&&p.turnSeat===S.seat&&!p.declaration&&!p.pause&&!p.pendingPass&&!p.pendingFinalChooser;
   const askBtn=document.getElementById('askBtn'), decBtn=document.getElementById('declareBtn'),
-        passBtn=document.getElementById('passBtn'), pauseBtn=document.getElementById('pauseBtn');
+        passBtn=document.getElementById('passBtn'), pauseBtn=document.getElementById('pauseBtn'),
+        chooseBtn=document.getElementById('chooseBtn');
   askBtn.disabled=!myTurn || !hasValidAsk();
-  decBtn.disabled=!playing || !!p.declaration || !!p.pause;
+  decBtn.disabled=!playing || !!p.declaration || !!p.pause || !!p.pendingFinalChooser;
   decBtn.classList.toggle('hidden', !playing);
   // pass turn button
   const showPass = !!p.pendingPass && p.pendingPass.seat===S.seat;
   passBtn.classList.toggle('hidden', !showPass);
+  // choose-final-declarer button (endgame: my team is out)
+  const showChoose = !!p.pendingFinalChooser && p.pendingFinalChooser.seat===S.seat;
+  chooseBtn.classList.toggle('hidden', !showChoose);
   // pause/resume
   if(p.pause && p.pause.bySeat===S.seat){ pauseBtn.textContent='Resume'; pauseBtn.disabled=false; }
   else if(p.pause){ pauseBtn.textContent='Paused'; pauseBtn.disabled=true; }
@@ -717,6 +723,16 @@ function openPass(){
     [{label:'Cancel',cls:'ghost',fn:closeModal}]);
 }
 function doPass(i){ sendRaw({cmd:'passTurn',toSeat:i}); closeModal(); }
+
+// ============================ Choose final declarer (endgame) ============================
+function openChooseFinal(){
+  const p=S.pub; if(!p.pendingFinalChooser||p.pendingFinalChooser.seat!==S.seat) return;
+  const opps=p.seats.filter(s=>s.team!==myTeam()&&s.handCount>0);
+  const html='<div class="opp-grid">'+opps.map(s=>'<button onclick="doChooseFinal('+s.seat+')">'+esc(s.name)+' ('+s.handCount+')</button>').join('')+'</div>';
+  modal('Choose who declares','Your team is out of cards. Pick an opponent who still holds cards — their team must declare every remaining set.',html,
+    [{label:'Cancel',cls:'ghost',fn:closeModal}]);
+}
+function doChooseFinal(i){ sendRaw({cmd:'chooseFinalDeclarer',toSeat:i}); closeModal(); }
 
 // ============================ Pause / leave ============================
 function togglePause(){ const p=S.pub; if(p.pause&&p.pause.bySeat===S.seat) sendRaw({cmd:'resume'}); else if(!p.pause) sendRaw({cmd:'pause'}); }
