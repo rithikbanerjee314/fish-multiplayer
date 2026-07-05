@@ -20,11 +20,21 @@ const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT) || 8080;
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const DECL_MS = 120000;      // 2-minute declaration limit (rule-mandated)
+const PLAYER_COUNT = 6;      // Fish is 6-player only in this build.
+const DECL_MS = 120000;      // 2-minute declaration safety cap (prevents an
+                             // abandoned declaration from hanging the table).
 const PAUSE_MS = 60000;      // Wait/Stop auto-resume cap (anti-abuse)
-const BOT_DELAY_MS = 1400;   // how long a bot "thinks" before acting
+// How long a bot "thinks" before acting. 5s in normal play so humans can follow
+// along; overridable (e.g. BOT_DELAY_MS=50) so headless tests run fast.
+const BOT_DELAY_MS = Number(process.env.BOT_DELAY_MS) || 5000;
 const DISCONNECT_BOT_MS = 8000; // grace before a bot covers a disconnected player's turn
 const ROOM_GC_MS = 30 * 60 * 1000;
+// Non-cheating bots only declare sets they're certain of, which can livelock if
+// two teammates each hold an un-asked card of the same set (neither can verify
+// the other). After this many asks with no declaration, the acting bot makes
+// its best-guess declaration so the game always makes progress. High enough that
+// genuine deduction usually resolves a set first; low enough to guarantee an end.
+const BOT_STALL_ASKS = 24;
 
 // ---------------------------------------------------------------------------
 // Cards & half-suits
@@ -166,7 +176,6 @@ function publicStateMsg(room) {
     pause: room.pause ? { bySeat: room.pause.bySeat, deadlineAt: room.pause.deadlineAt } : null,
     pendingPass: room.pendingPass ? { seat: room.pendingPass.seat } : null,
     pendingFinalChooser: room.pendingFinalChooser ? { seat: room.pendingFinalChooser.seat } : null,
-    turnDeadlineAt: room.turnDeadlineAt,
     winner: room.winner,
   };
 }
@@ -189,41 +198,22 @@ function lobbyBroadcast(room) {
 }
 
 // ---------------------------------------------------------------------------
-// Timers
+// Timers (declaration safety cap + pause auto-resume only; no per-turn timer)
 // ---------------------------------------------------------------------------
 function clearTimer(room, key) {
   if (room.timers[key]) { clearTimeout(room.timers[key]); room.timers[key] = null; }
-}
-function armTurnTimer(room) {
-  clearTimer(room, 'turn');
-  room.turnDeadlineAt = null;
-  if (room.status !== 'playing' || room.declaration || room.pause || room.pendingPass || room.pendingFinalChooser) return;
-  if (!room.config.turnTimerSec) return;
-  const seat = room.seats[room.turnSeat];
-  if (!seat || seat.isBot) return; // bots act on their own schedule
-  room.turnDeadlineAt = Date.now() + room.config.turnTimerSec * 1000;
-  room.timers.turn = setTimeout(() => onTurnTimeout(room), room.config.turnTimerSec * 1000);
-}
-function onTurnTimeout(room) {
-  if (room.status !== 'playing' || room.declaration || room.pause || room.pendingPass || room.pendingFinalChooser) return;
-  const seat = room.turnSeat;
-  // Auto-play a valid question for the stalled human (uses non-cheating bot logic).
-  const ask = chooseAsk(room, seat, false);
-  if (ask) applyAsk(room, seat, ask.targetSeat, ask.cardId);
-  else { sendStates(room); }
 }
 
 // ---------------------------------------------------------------------------
 // Lobby handlers
 // ---------------------------------------------------------------------------
-function makeRoom(playerCount, teamMode, turnTimerSec) {
-  const mode = playerCount === 8 ? '8' : '6';
+function makeRoom(teamMode) {
   return {
     code: generateCode(),
     status: 'lobby',
-    config: { playerCount, teamMode, mode, turnTimerSec: turnTimerSec || null, declMs: DECL_MS },
+    config: { playerCount: PLAYER_COUNT, teamMode, mode: '6', declMs: DECL_MS },
     hostSeat: 0,
-    seats: emptySeats(playerCount),
+    seats: emptySeats(PLAYER_COUNT),
     dealerSeat: null,
     turnSeat: null,
     lastQuestion: null,
@@ -232,11 +222,11 @@ function makeRoom(playerCount, teamMode, turnTimerSec) {
     pause: null,
     pendingPass: null,
     pendingFinalChooser: null,
-    turnDeadlineAt: null,
     endgame: false,
     winner: null,
     knowledge: freshKnowledge(),
-    timers: { turn: null, decl: null, pause: null },
+    asksSinceDeclare: 0,
+    timers: { decl: null, pause: null },
     botTimers: {},
     disconnectTimers: {},
     createdAt: Date.now(),
@@ -254,12 +244,9 @@ function firstFreeSeat(room, parity) {
 }
 
 function handleCreate(ws, msg) {
-  const playerCount = msg.playerCount === 8 ? 8 : 6;
   const teamMode = msg.teamMode === 'manual' ? 'manual' : 'random';
-  const turnTimerSec = (typeof msg.turnTimerSec === 'number' && msg.turnTimerSec > 0)
-    ? Math.min(300, Math.floor(msg.turnTimerSec)) : null;
   const name = sanitizeName(msg.name) || 'Player 1';
-  const room = makeRoom(playerCount, teamMode, turnTimerSec);
+  const room = makeRoom(teamMode);
   const token = generateToken();
   room.seats[0] = { name, token, socket: ws, isBot: false, connected: true, hand: [] };
   room.hostSeat = 0;
@@ -294,21 +281,31 @@ function requireHost(ws, room) {
   return meta && room && meta.seat === room.hostSeat && !room.seats[room.hostSeat].isBot;
 }
 
-function handleSetTeam(ws, msg) {
+// Manual team control: ONLY the host arranges teams, by swapping two seats
+// (team = seat parity). The host may never move their own seat, so their team
+// never changes; they can swap any two other seats — including swapping two
+// already-joined players, or moving a player into an empty seat on the other
+// team. Non-hosts cannot change anyone's team.
+function handleSwapSeats(ws, msg) {
   const meta = sockets.get(ws); if (!meta) return;
   const room = rooms.get(meta.code); if (!room || room.status !== 'lobby') return;
   if (room.config.teamMode !== 'manual') { sendError(ws, 'NO_MANUAL', 'Teams are auto-assigned in this room.'); return; }
-  const wantTeam = msg.team === 1 ? 1 : 0;
-  if (teamOf(meta.seat) === wantTeam) return;
-  const target = firstFreeSeat(room, wantTeam);
-  if (target < 0) { sendError(ws, 'TEAM_FULL', 'That team is full.'); return; }
-  const prevSeat = meta.seat;
-  const occ = room.seats[prevSeat];
-  room.seats[prevSeat] = null;
-  room.seats[target] = occ;
-  meta.seat = target;
-  if (room.hostSeat === prevSeat) room.hostSeat = target;
-  reassignHostIfNeeded(room);
+  if (!requireHost(ws, room)) { sendError(ws, 'NOT_HOST', 'Only the host can change teams.'); return; }
+  const a = msg.seatA, b = msg.seatB;
+  const n = room.seats.length;
+  if (typeof a !== 'number' || typeof b !== 'number' || a === b || a < 0 || b < 0 || a >= n || b >= n) {
+    sendError(ws, 'BAD_SWAP', 'Pick two different seats to swap.'); return;
+  }
+  if (a === room.hostSeat || b === room.hostSeat) {
+    sendError(ws, 'NO_SELF', 'You can\'t change your own team.'); return;
+  }
+  const occA = room.seats[a], occB = room.seats[b];
+  if (!occA && !occB) return; // both empty — nothing to do
+  room.seats[a] = occB;
+  room.seats[b] = occA;
+  // Keep each moved human's socket→seat mapping current.
+  if (occA && occA.socket) { const m = sockets.get(occA.socket); if (m) m.seat = b; }
+  if (occB && occB.socket) { const m = sockets.get(occB.socket); if (m) m.seat = a; }
   sendStates(room);
 }
 
@@ -392,6 +389,7 @@ function dealAndStart(room) {
   room.pendingFinalChooser = null;
   room.endgame = false; room.winner = null;
   room.knowledge = freshKnowledge();
+  room.asksSinceDeclare = 0;
 
   // Seats may have changed (random team shuffle). Tell every connected human its
   // current seat so the client adopts it before receiving state (otherwise the
@@ -403,7 +401,6 @@ function dealAndStart(room) {
 
   broadcast(room, { type: 'dealt', dealerSeat: room.dealerSeat });
   sendStates(room);
-  armTurnTimer(room);
   scheduleBotIfNeeded(room);
 }
 
@@ -422,11 +419,20 @@ function kInSet(room, seat, hs) {
   (room.knowledge.inSet[seat] = room.knowledge.inSet[seat] || new Set()).add(hs);
 }
 function recordAsk(room, askerSeat, targetSeat, cardId, got) {
+  // Everything derivable here is PUBLIC — any attentive player watching the ask
+  // learns the same facts. Bots use only this plus their own hand; they never
+  // peek at hidden hands.
   const hs = cardHalfSuit(cardId);
   kInSet(room, askerSeat, hs);      // asker must hold another card in this half-suit
-  kLacks(room, askerSeat, cardId);  // asker didn't have the asked card
-  if (got) { kHas(room, askerSeat, cardId); }
-  else { kLacks(room, targetSeat, cardId); }
+  kLacks(room, askerSeat, cardId);  // asker didn't have the asked card (they asked for it)
+  if (got) {
+    // Card moves target → asker: no one else can be holding it anymore.
+    for (const seat in room.knowledge.has) room.knowledge.has[seat].delete(cardId);
+    kHas(room, askerSeat, cardId);
+    for (let i = 0; i < room.seats.length; i++) if (i !== askerSeat) kLacks(room, i, cardId);
+  } else {
+    kLacks(room, targetSeat, cardId); // target publicly shown not to hold it
+  }
 }
 function clearKnowledgeForSet(room, hsId) {
   const cards = halfSuitCards(hsId, room.config.mode);
@@ -481,6 +487,7 @@ function applyAsk(room, askerSeat, targetSeat, cardId) {
     asker.hand = sortHand(asker.hand);
   }
   recordAsk(room, askerSeat, targetSeat, cardId, got);
+  room.asksSinceDeclare = (room.asksSinceDeclare || 0) + 1;
   room.lastQuestion = { askerSeat, targetSeat, cardId, result: got ? 'got' : 'denied' };
   broadcast(room, {
     type: 'askResult', askerSeat, targetSeat, cardId, got,
@@ -490,7 +497,6 @@ function applyAsk(room, askerSeat, targetSeat, cardId) {
   const ended = checkEndConditions(room);
   if (!ended) {
     sendStates(room);
-    armTurnTimer(room);
     scheduleBotIfNeeded(room);
   }
 }
@@ -513,7 +519,6 @@ function handleDeclareStart(ws, msg) {
 }
 
 function beginDeclaration(room, declarerSeat, hsId) {
-  clearTimer(room, 'turn'); room.turnDeadlineAt = null;
   room.declaration = {
     declarerSeat, hsId,
     deadlineAt: Date.now() + DECL_MS,
@@ -531,7 +536,6 @@ function onDeclareTimeout(room) {
   clearTimer(room, 'decl');
   room.turnSeat = ret;
   sendStates(room);
-  armTurnTimer(room);
   scheduleBotIfNeeded(room);
 }
 
@@ -584,6 +588,7 @@ function resolveDeclaration(room, declarerSeat, hsId, assignments) {
     }
   }
   room.claimed[winner].push(hsId);
+  room.asksSinceDeclare = 0;
   clearKnowledgeForSet(room, hsId);
 
   const reveal = cards.map(c => ({ cardId: c, actualSeat: actual[c], assignedSeat: assignments[c] }));
@@ -601,7 +606,6 @@ function resolveDeclaration(room, declarerSeat, hsId, assignments) {
 
   if (!checkEndConditions(room)) {
     sendStates(room);
-    armTurnTimer(room);
     scheduleBotIfNeeded(room);
   }
 }
@@ -644,7 +648,6 @@ function handlePassTurn(ws, msg) {
   room.pendingPass = null;
   room.turnSeat = to;
   sendStates(room);
-  armTurnTimer(room);
   scheduleBotIfNeeded(room);
 }
 
@@ -662,7 +665,6 @@ function handleChooseFinalDeclarer(ws, msg) {
   room.pendingFinalChooser = null;
   room.turnSeat = to;
   sendStates(room);
-  armTurnTimer(room);
   scheduleBotIfNeeded(room);
 }
 
@@ -690,7 +692,7 @@ function finishGame(room) {
   room.status = 'finished';
   room.endgame = false;
   room.declaration = null; room.pause = null; room.pendingPass = null;
-  clearTimer(room, 'turn'); clearTimer(room, 'decl'); clearTimer(room, 'pause');
+  clearTimer(room, 'decl'); clearTimer(room, 'pause');
   for (const k in room.botTimers) { clearTimeout(room.botTimers[k]); }
   room.botTimers = {};
   const a = room.claimed[0].length, b = room.claimed[1].length;
@@ -707,7 +709,6 @@ function handlePause(ws) {
   const room = rooms.get(meta.code); if (!room || room.status !== 'playing') return;
   if (room.pause || room.declaration || room.pendingFinalChooser) return;
   room.pause = { bySeat: meta.seat, deadlineAt: Date.now() + PAUSE_MS };
-  clearTimer(room, 'turn'); room.turnDeadlineAt = null;
   room.timers.pause = setTimeout(() => { if (room.pause) doResume(room); }, PAUSE_MS);
   sendStates(room);
 }
@@ -721,7 +722,6 @@ function doResume(room) {
   clearTimer(room, 'pause');
   room.pause = null;
   sendStates(room);
-  armTurnTimer(room);
   scheduleBotIfNeeded(room);
 }
 
@@ -760,7 +760,7 @@ function maybeBotPass(room) {
     if (mates.length) {
       room.pendingPass = null;
       room.turnSeat = mates[Math.floor(Math.random() * mates.length)];
-      sendStates(room); armTurnTimer(room); scheduleBotIfNeeded(room);
+      sendStates(room); scheduleBotIfNeeded(room);
     }
   }, BOT_DELAY_MS);
 }
@@ -780,129 +780,114 @@ function maybeBotChooseFinal(room) {
     if (!opps.length) return;
     room.pendingFinalChooser = null;
     room.turnSeat = opps[Math.floor(Math.random() * opps.length)];
-    sendStates(room); armTurnTimer(room); scheduleBotIfNeeded(room);
+    sendStates(room); scheduleBotIfNeeded(room);
   }, BOT_DELAY_MS);
 }
 
+// Bots know ONLY their own hand plus what any attentive player could deduce from
+// witnessed asks/declarations (room.knowledge). They never look at hidden hands.
 function botAct(room, seat) {
   if (room.status !== 'playing' || room.turnSeat !== seat) return;
   if (room.pause || room.declaration || room.pendingPass) return;
   const s = room.seats[seat];
   if (!s || (!s.isBot && s.connected)) return; // human reconnected
 
-  // 1) Declare any set this bot holds entirely (always correct).
-  const selfSet = findSelfCompleteSet(room, seat);
-  if (selfSet) { autoDeclare(room, seat, selfSet); return; }
+  // 1) Declare a set the bot is CERTAIN of — every card is either in its own
+  //    hand or was publicly seen to land with a specific teammate. Always exact,
+  //    so it never gives a set away by guessing.
+  const sure = findConfidentSet(room, seat);
+  if (sure) { autoDeclareWith(room, seat, sure.hsId, sure.assignments); return; }
 
-  // 2) Declare any set the bot's whole team has consolidated. A coordinated team
-  //    would call this immediately, and it keeps play progressing toward an end.
-  {
-    const myTeam = teamOf(seat);
-    const remaining = allHalfSuits(room.config.mode).filter(h => !room.claimed[0].includes(h) && !room.claimed[1].includes(h));
-    for (const h of remaining) {
-      if (setEntirelyHeldByTeam(room, h, myTeam)) { autoDeclareTrue(room, seat, h); return; }
-    }
+  // 2) Otherwise ask — unless play has stalled (lots of asks, no declaration:
+  //    two teammates each sitting on an un-asked card of a set can circle
+  //    forever). chooseAsk uses only own hand + public history: a card the bot
+  //    lacks in one of its sets, preferring one a specific opponent was seen to
+  //    hold and avoiding opponents publicly shown to lack it.
+  const stalled = (room.asksSinceDeclare || 0) >= BOT_STALL_ASKS;
+  if (!stalled) {
+    const ask = chooseAsk(room, seat, true);
+    if (ask) { applyAsk(room, seat, ask.targetSeat, ask.cardId); return; }
   }
 
-  // 3) In endgame, the card-holding team must declare out remaining sets.
-  //    Bots use true locations here purely so bot games can conclude.
-  if (room.endgame && teamCardTotal(room, teamOf(seat)) > 0) {
-    const remaining = allHalfSuits(room.config.mode).filter(h => !room.claimed[0].includes(h) && !room.claimed[1].includes(h));
-    for (const h of remaining) {
-      if (setEntirelyHeldByTeam(room, h, teamOf(seat))) { autoDeclareTrue(room, seat, h); return; }
-    }
-    // can't safely declare; if no valid ask either, give the most-held set away
-    if (remaining.length && !chooseAsk(room, seat, true)) { autoDeclareTrue(room, seat, remaining[0]); return; }
-  }
+  // 3) No legal ask left (endgame: opponents are out of cards) OR play has
+  //    stalled. The bot declares to make progress, deducing what it can and
+  //    guessing the rest — sometimes wrong, just like a real player forced to
+  //    call a set they aren't fully sure of.
+  const guess = chooseGuessDeclare(room, seat);
+  if (guess) { autoDeclareWith(room, seat, guess.hsId, guess.assignments); return; }
 
-  // 3) Otherwise, ask. Prefer pulling an opponent-held card into a set my team is
-  //    consolidating: it's always a legal, successful ask, so the bot keeps the turn
-  //    and can complete the set (then step 2 declares it). This makes bot games
-  //    actually conclude instead of circulating cards forever.
-  let ask = botConsolidationAsk(room, seat);
-  if (!ask) ask = chooseAsk(room, seat, true);
+  // 4) Fallback (bot momentarily has no cards in any remaining set): just ask.
+  const ask = chooseAsk(room, seat, true);
   if (ask) { applyAsk(room, seat, ask.targetSeat, ask.cardId); return; }
-
-  // 4) No valid ask and not endgame-declarable: try any self set or stall.
-  const anyRemaining = allHalfSuits(room.config.mode).filter(h => !room.claimed[0].includes(h) && !room.claimed[1].includes(h));
-  for (const h of anyRemaining) {
-    if (handHasInSet(s.hand, h, room.config.mode)) { autoDeclareTrue(room, seat, h); return; }
-  }
 }
 
-function findSelfCompleteSet(room, seat) {
+function remainingSets(room) {
+  return allHalfSuits(room.config.mode).filter(h => !room.claimed[0].includes(h) && !room.claimed[1].includes(h));
+}
+
+// Seat publicly known to hold `card` (from a witnessed successful ask), or -1.
+function knownHolder(room, card) {
+  for (const seat in room.knowledge.has) {
+    if (room.knowledge.has[seat].has(card)) return Number(seat);
+  }
+  return -1;
+}
+
+// A set is "confident" iff every card is either in the bot's own hand or was
+// seen to land with a specific teammate — so the exact declaration is certain.
+function findConfidentSet(room, seat) {
+  const mode = room.config.mode;
+  const myTeam = teamOf(seat);
   const hand = room.seats[seat].hand;
-  for (const h of allHalfSuits(room.config.mode)) {
-    if (room.claimed[0].includes(h) || room.claimed[1].includes(h)) continue;
-    if (halfSuitCards(h, room.config.mode).every(c => hand.includes(c))) return h;
+  for (const h of remainingSets(room)) {
+    const cards = halfSuitCards(h, mode);
+    const assignments = {};
+    let ok = true;
+    for (const c of cards) {
+      if (hand.includes(c)) { assignments[c] = seat; continue; }
+      const kh = knownHolder(room, c);
+      if (kh >= 0 && teamOf(kh) === myTeam) { assignments[c] = kh; continue; }
+      ok = false; break;
+    }
+    if (ok) return { hsId: h, assignments };
   }
   return null;
 }
 
-function setEntirelyHeldByTeam(room, hsId, team) {
-  const cards = halfSuitCards(hsId, room.config.mode);
-  for (const c of cards) {
-    let holder = -1;
-    for (let i = 0; i < room.seats.length; i++) if (room.seats[i] && room.seats[i].hand.includes(c)) { holder = i; break; }
-    if (holder < 0 || teamOf(holder) !== team) return false;
-  }
-  return true;
-}
-
-function autoDeclare(room, seat, hsId) {
-  // self-complete: assign all to self
-  const assignments = {};
-  for (const c of halfSuitCards(hsId, room.config.mode)) assignments[c] = seat;
-  beginDeclaration(room, seat, hsId);
-  resolveDeclaration(room, seat, hsId, assignments);
-}
-function autoDeclareTrue(room, seat, hsId) {
-  // declare with true locations (endgame conclusion helper for bots)
-  const assignments = {};
-  const team = teamOf(seat);
-  let ok = true;
-  for (const c of halfSuitCards(hsId, room.config.mode)) {
-    let holder = -1;
-    for (let i = 0; i < room.seats.length; i++) if (room.seats[i] && room.seats[i].hand.includes(c)) { holder = i; break; }
-    assignments[c] = holder;
-    if (holder < 0 || teamOf(holder) !== team) ok = false;
-  }
-  beginDeclaration(room, seat, hsId);
-  if (!ok) {
-    // map any off-team/missing to self so it resolves as a (failed) declaration → opponents get it
-    for (const c of halfSuitCards(hsId, room.config.mode)) if (teamOf(assignments[c]) !== team || assignments[c] < 0) assignments[c] = seat;
-  }
-  resolveDeclaration(room, seat, hsId, assignments);
-}
-
-// Bot ask that drives a set toward completion on the bot's own team using known
-// card locations. Picks a set the bot has a base card in where an opponent still
-// holds a card, preferring the set the team has most consolidated. Always legal
-// and always a successful pull, so the bot retains the turn and finishes the set.
-function botConsolidationAsk(room, seat) {
-  const myTeam = teamOf(seat);
+// Forced endgame declaration: pick the remaining set the bot holds the most of,
+// assign own/known cards correctly and guess a card-holding teammate for the
+// rest. Only used when the bot has no legal ask, so the game always concludes.
+function chooseGuessDeclare(room, seat) {
   const mode = room.config.mode;
+  const myTeam = teamOf(seat);
   const hand = room.seats[seat].hand;
-  const sets = [...new Set(hand.map(cardHalfSuit))]
-    .filter(h => !room.claimed[0].includes(h) && !room.claimed[1].includes(h));
-  let best = null, bestScore = -1;
-  for (const h of sets) {
-    const cards = halfSuitCards(h, mode);
-    let teamCount = 0;
-    const oppHeld = [];
-    for (const c of cards) {
-      let holder = -1;
-      for (let i = 0; i < room.seats.length; i++) {
-        if (room.seats[i] && room.seats[i].hand.includes(c)) { holder = i; break; }
-      }
-      if (holder < 0) continue;
-      if (teamOf(holder) === myTeam) teamCount++;
-      else oppHeld.push({ card: c, seat: holder });
-    }
-    if (!oppHeld.length) continue; // nothing to pull (set already team-complete → step 2 declares)
-    if (teamCount > bestScore) { bestScore = teamCount; best = { targetSeat: oppHeld[0].seat, cardId: oppHeld[0].card }; }
+  let best = null, bestCount = -1;
+  for (const h of remainingSets(room)) {
+    const mine = halfSuitCards(h, mode).filter(c => hand.includes(c)).length;
+    if (mine > bestCount) { bestCount = mine; best = h; }
   }
-  return best;
+  if (!best) return null;
+  const withCards = [];
+  for (let i = 0; i < room.seats.length; i++) {
+    if (teamOf(i) === myTeam && room.seats[i] && room.seats[i].hand.length > 0) withCards.push(i);
+  }
+  // For an unknown card, guess a teammate publicly seen collecting this set
+  // (has asked in it → holds a base card), else any teammate with cards.
+  const inSetMates = withCards.filter(m => m !== seat && room.knowledge.inSet[m] && room.knowledge.inSet[m].has(best));
+  const guessMate = inSetMates.length ? inSetMates[0] : (withCards.length ? withCards[0] : seat);
+  const assignments = {};
+  for (const c of halfSuitCards(best, mode)) {
+    if (hand.includes(c)) { assignments[c] = seat; continue; }
+    const kh = knownHolder(room, c);
+    if (kh >= 0 && teamOf(kh) === myTeam) { assignments[c] = kh; continue; }
+    assignments[c] = guessMate;
+  }
+  return { hsId: best, assignments };
+}
+
+function autoDeclareWith(room, seat, hsId, assignments) {
+  beginDeclaration(room, seat, hsId);
+  resolveDeclaration(room, seat, hsId, assignments);
 }
 
 // Non-cheating ask chooser, shared by bots and human turn-timeouts.
@@ -1015,7 +1000,7 @@ function handleClose(ws) {
 }
 
 function cleanupRoom(room) {
-  clearTimer(room, 'turn'); clearTimer(room, 'decl'); clearTimer(room, 'pause');
+  clearTimer(room, 'decl'); clearTimer(room, 'pause');
   for (const k in room.botTimers) if (room.botTimers[k]) clearTimeout(room.botTimers[k]);
   for (const k in room.disconnectTimers) if (room.disconnectTimers[k]) clearTimeout(room.disconnectTimers[k]);
   rooms.delete(room.code);
@@ -1065,7 +1050,7 @@ const HANDLERS = {
   create: handleCreate,
   join: handleJoin,
   reconnect: handleReconnect,
-  setTeam: handleSetTeam,
+  swapSeats: handleSwapSeats,
   addBot: handleAddBot,
   removeBot: handleRemoveBot,
   startGame: handleStartGame,

@@ -9,7 +9,7 @@ const LOW = ['2', '3', '4', '5', '6', '7'], HIGH = ['9', '10', 'J', 'Q', 'K', 'A
 function cardHalf(c) { if (c === 'JR' || c === 'JB') return 'EIGHTS'; const r = c.slice(1); if (r === '8') return 'EIGHTS'; return c[0] + (LOW.includes(r) ? '_LOW' : '_HIGH'); }
 function setCards(h) { if (h === 'EIGHTS') return ['S8', 'H8', 'D8', 'C8', 'JR', 'JB']; const s = h[0]; const ranks = h.endsWith('_LOW') ? LOW : HIGH; return ranks.map(r => s + r); }
 
-const MODE = process.argv[2] === '8' ? 8 : 6;
+const MODE = 6; // Fish is 6-player only.
 let seat = null, code = null, token = null, hand = [], pub = null;
 let started = false, acting = false, gotGameOver = false;
 const log = (...a) => console.log('[test]', ...a);
@@ -19,7 +19,7 @@ const MAX_ACTIONS = 2000;
 const ws = new WebSocket(URL);
 ws.on('open', () => {
   log('connected; creating ' + MODE + '-player room');
-  send({ cmd: 'create', name: 'Tester', playerCount: MODE, teamMode: 'random', turnTimerSec: 0 });
+  send({ cmd: 'create', name: 'Tester', teamMode: 'random' });
 });
 ws.on('message', (raw) => { let m; try { m = JSON.parse(raw); } catch (_) { return; } onMsg(m); });
 ws.on('close', () => log('socket closed'));
@@ -149,5 +149,6 @@ function dump() {
     ' counts=' + pub.seats.map(s => s.handCount).join(','));
 }
 
-// Global timeout
-setTimeout(() => { if (!gotGameOver) { log('!! TIMEOUT — no gameOver within 60s'); dump(); process.exit(3); } }, 60000);
+// Global timeout. Non-cheating bots play longer games, so run the server with a
+// small BOT_DELAY_MS (e.g. BOT_DELAY_MS=30) when driving this harness.
+setTimeout(() => { if (!gotGameOver) { log('!! TIMEOUT — no gameOver in time'); dump(); process.exit(3); } }, 180000);

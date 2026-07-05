@@ -2,8 +2,8 @@
 
 An online, browser-based implementation of the partnership card game **Fish**
 (a.k.a. Literature). A single authoritative Node.js WebSocket server holds all
-hidden state; a single-file HTML SPA is the client. Supports 6- and 8-player
-games, server-side AI bots, token-based reconnect, and animated play.
+hidden state; a single-file HTML SPA is the client. **6-player only**, with
+server-side AI bots, token-based reconnect, and animated play.
 
 ## Run locally
 
@@ -34,15 +34,20 @@ state and rejects stale/illegal ones with `error`. Clients never run the engine
 and never diverge optimistically — they reconcile from the next `publicState`.
 
 ### Deck & half-suits
-- **6 players**: full 54-card deck (incl. 2 jokers), 9 cards each, **9 half-suits**.
-- **8 players**: 48-card deck (four 8s + both jokers removed), 6 cards each, **8 half-suits**.
+- **6 players** (the only mode): full 54-card deck (incl. 2 jokers), 9 cards
+  each, **9 half-suits**. `PLAYER_COUNT` is fixed at 6 server-side; there is no
+  player-count choice.
 - Card ids: `"S2"`, `"H10"`, `"CA"`, jokers `"JR"`/`"JB"`.
 - Half-suit ids: `{S,H,D,C}` × `{_LOW (2–7), _HIGH (9–A)}`, plus `"EIGHTS"`
-  (four 8s + 2 jokers), the eights set existing only in 6-player mode.
+  (four 8s + 2 jokers).
 
 ### Teams & seating
 - `team = seatIndex % 2` (alternating seating, enforced server-side).
-- Host picks **random** (balanced auto-assign) or **manual** (`setTeam` in lobby).
+- Host picks **random** (balanced auto-assign) or **manual**. In manual mode
+  **only the host** arranges teams, by swapping two seats (`swapSeats` in lobby).
+  The host can never move their own seat (their team is fixed) and can swap any
+  two *other* seats — including swapping two joined players or moving a player
+  into an open seat on the other team. Non-hosts cannot change anyone's team.
 
 ## State model
 
@@ -54,12 +59,12 @@ the sibling Chess project).
 ```
 room = {
   code, status: 'lobby'|'playing'|'finished',
-  config: { playerCount, teamMode, mode:'6'|'8', turnTimerSec|null, declTimerSec },
+  config: { playerCount:6, teamMode, mode:'6', declMs },
   seats: [ { seat, name, token, socket, team, isBot, connected, hand:[ids] } ], // hand SECRET
   hostSeat, turnSeat,
   lastQuestion, claimed:{0:[hsId],1:[hsId]},
-  declaration | null, pause | null,
-  turnDeadlineAt | null, ...timers
+  declaration | null, pause | null, pendingPass | null, pendingFinalChooser | null,
+  ...timers (decl safety cap + pause cap only; no per-turn timer)
 }
 ```
 
@@ -67,7 +72,7 @@ room = {
 
 Dispatched through the `HANDLERS` table in `server.js`.
 
-**Client → Server (`cmd`)**: `create`, `join`, `reconnect`, `setTeam`,
+**Client → Server (`cmd`)**: `create`, `join`, `reconnect`, `swapSeats`,
 `addBot`, `removeBot`, `startGame`, `ask`, `declareStart`, `declareSubmit`,
 `declareCancel`, `passTurn`, `chooseFinalDeclarer`, `pause`, `resume`.
 
@@ -100,22 +105,32 @@ reveal for animation), `gameOver`, `playerDisconnected`, `error`.
   can declare the rest. Bots/disconnected choosers auto-pick. This prevents the
   turn from stalling on a cardless seat with sets still unclaimed.
 
-### Timers (sent as absolute `deadlineAt` ms; clients render drift-free)
-- `DECL_MS = 120000` — 2-minute declaration limit.
+### Timers
+There is **no player-facing timer** — turns are never timed and no countdown is
+shown. The only timers are invisible server-side safety caps:
+- `DECL_MS = 120000` — an abandoned declaration auto-cancels after 2 min so it
+  can't hang the table (no on-screen countdown).
 - `PAUSE_MS = 60000` — Wait/Stop auto-resume cap (anti-abuse).
-- `BOT_DELAY_MS = 1400` — bot "think" delay before acting.
+- `BOT_DELAY_MS = 5000` — bot "think" delay before acting (5 s so humans can
+  follow along). Override with the env var (e.g. `BOT_DELAY_MS=30`) to run the
+  headless tests fast.
 - `DISCONNECT_BOT_MS = 8000` — grace before a bot covers a disconnected
   player's turn so the game never stalls.
-- Optional host-configurable turn timer: on expiry the server plays a random
-  *valid* question for the turn-holder.
 
 ## Bots
 
-Server-side. Track public history + own hand. On their turn they pull
-opponent-held cards into half-suits their team is consolidating
-(`botConsolidationAsk`, keeping the turn on success), then declare any set their
-whole team has consolidated (`autoDeclareTrue`). Also auto-act for a
-disconnected human past the grace window.
+Server-side, and they **only ever see their own hand plus public history** —
+never any hidden hand. Public knowledge (`room.knowledge`) mirrors exactly what
+an attentive player deduces from witnessed asks/declarations. On their turn a
+bot: (1) declares a set it is **certain** of — every card either in its own hand
+or publicly seen to land with a specific teammate (`findConfidentSet`, always an
+exact call); else (2) asks (`chooseAsk` — a card it lacks in one of its sets,
+preferring one an opponent was seen to hold, avoiding opponents shown to lack
+it); else (3) when no legal ask remains (the endgame, opponents out of cards) it
+must declare to finish, deducing what it can and **guessing** the rest
+(`chooseGuessDeclare`) — sometimes wrong, like a real forced call. Bots also
+auto-act for a disconnected human past the grace window, and auto-pick a final
+declarer / teammate pass when it lands on them.
 
 ## Deployment
 
@@ -127,22 +142,24 @@ disconnected human past the grace window.
 
 ## Tests
 
-Headless Node WS harnesses (run against a local `node server.js`):
+Headless Node WS harnesses (run against a local server). Bots now think for 5 s
+and never cheat, so start the server with a small bot delay (and the test hook)
+so full-game harnesses finish quickly:
 
 ```
-node test_harness.js 6      # full 6p game loop, asserts all 9 sets accounted for
-node test_harness.js 8      # full 8p game loop, asserts all 8 sets accounted for
+FISH_TEST=1 BOT_DELAY_MS=30 node server.js
+```
+
+Then, in another shell:
+
+```
+node test_harness.js        # full 6p game loop, asserts all 9 sets accounted for
 node test_edge.js           # reconnect restores seat+hand; wrong declaration → opponents
 node test_refresh_decl.js   # two humans: refresh mid-declaration recovers & resolves
-```
-
-Two tests need the deterministic test hook, so start the server with it enabled
-(`FISH_TEST=1 node server.js`) — the `__test_setup` cmd is inert otherwise:
-
-```
 node test_final_declarer.js # forces a whole-team-out endgame; asserts the
                             # pendingFinalChooser → chooseFinalDeclarer path
 ```
 
-The `test_*.js` harnesses (and the `FISH_TEST` hook, which is off in prod) are
-excluded from the Vercel deploy.
+`test_final_declarer.js` needs the `FISH_TEST=1` hook (`__test_setup`, inert
+otherwise). The `test_*.js` harnesses (and the `FISH_TEST` hook, which is off in
+prod) are excluded from the Vercel deploy.

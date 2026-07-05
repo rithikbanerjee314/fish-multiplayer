@@ -69,6 +69,9 @@ input:focus,select:focus{border-color:var(--gold)}
 .seat-row{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:10px;background:var(--panel2);
   margin-bottom:8px;min-height:44px}
 .seat-row.me{outline:1px solid var(--gold)}
+.seat-row.sel{outline:2px solid var(--gold2);box-shadow:0 0 0 2px rgba(227,196,137,.5)}
+.seat-row.pickable{cursor:pointer}
+.seat-row.pickable:hover{border-color:var(--gold)}
 .seat-row .av{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;
   font-weight:700;background:var(--t0);color:#06121d;flex:none}
 .t1 .seat-row .av{background:var(--t1)}
@@ -241,25 +244,13 @@ input:focus,select:focus{border-color:var(--gold)}
 
     <div id="pane-create">
       <div class="field"><label>Your name</label><input id="c-name" maxlength="16" placeholder="e.g. Alex"></div>
-      <div class="field"><label>Players</label>
-        <div class="seg" id="c-count">
-          <button data-v="6" class="sel">6 players</button>
-          <button data-v="8">8 players</button>
-        </div>
-      </div>
       <div class="field"><label>Teams</label>
         <div class="seg" id="c-team">
           <button data-v="random" class="sel">Random</button>
           <button data-v="manual">Choose in lobby</button>
         </div>
       </div>
-      <div class="field"><label>Turn timer (optional)</label>
-        <div class="seg" id="c-timer">
-          <button data-v="0" class="sel">Off</button>
-          <button data-v="30">30s</button>
-          <button data-v="60">60s</button>
-        </div>
-      </div>
+      <div class="mini" style="color:var(--muted);font-size:12px;margin-bottom:14px">6 players · fill empty seats with bots in the lobby</div>
       <button class="primary" style="width:100%" onclick="doCreate()">Create &amp; open lobby</button>
       <div class="err" id="c-err"></div>
     </div>
@@ -404,15 +395,14 @@ function segWire(id){
   });
 }
 function segVal(id){ const b=document.querySelector('#'+id+' button.sel'); return b?b.dataset.v:null; }
-['c-count','c-team','c-timer'].forEach(segWire);
+['c-team'].forEach(segWire);
 
 function doCreate(){
   const name=document.getElementById('c-name').value.trim();
   if(!name){ setText('c-err','Enter your name.'); return; }
   setText('c-err','');
   clearSession();
-  sendRaw({cmd:'create', name, playerCount:Number(segVal('c-count')),
-    teamMode:segVal('c-team'), turnTimerSec:Number(segVal('c-timer'))});
+  sendRaw({cmd:'create', name, teamMode:segVal('c-team')});
 }
 function doJoin(){
   const name=document.getElementById('j-name').value.trim();
@@ -439,15 +429,24 @@ function myTeam(){ return S.seat%2; }
 function seatName(i){ const s=S.pub&&S.pub.seats[i]; return s? (s.name|| (s.empty?'(empty)':'Player '+(i+1))) : 'Player '+(i+1); }
 
 // ---- Lobby ----
+let lobbySwapSel=null; // seat the host picked as the first half of a swap
 function renderLobby(){
-  const p=S.pub;
+  const p=S.pub, host=(S.seat===p.hostSeat);
+  const canArrange = host && p.config.teamMode==='manual';
+  if(lobbySwapSel===p.hostSeat) lobbySwapSel=null; // host can never be swapped
   setText('lobby-code', p.code);
   const human=p.seats.filter(s=>!s.empty&&!s.isBot).length;
-  setText('lobby-sub', p.config.playerCount+' players · teams '+(p.config.teamMode)+' · '+human+' joined');
+  let sub=p.config.playerCount+' players · teams '+(p.config.teamMode)+' · '+human+' joined';
+  if(canArrange) sub+=' · tap two seats to swap their teams';
+  setText('lobby-sub', sub);
   for(const t of [0,1]){
     const wrap=document.querySelector('#team'+t+' .seats'); wrap.innerHTML='';
     p.seats.filter(s=>s.team===t).forEach(s=>{
-      const row=document.createElement('div'); row.className='seat-row'+(s.empty?' empty':'')+(s.seat===S.seat?' me':'');
+      const selectable = canArrange && s.seat!==p.hostSeat;
+      const row=document.createElement('div');
+      row.className='seat-row'+(s.empty?' empty':'')+(s.seat===S.seat?' me':'')+
+        (selectable?' pickable':'')+(s.seat===lobbySwapSel?' sel':'');
+      if(selectable) row.onclick=()=>lobbyPickSeat(s.seat);
       if(s.empty){ row.innerHTML='<span class="av" style="opacity:.4">·</span><span class="nm">Open seat</span>'; }
       else{
         const init=(s.name||'?')[0].toUpperCase();
@@ -459,14 +458,19 @@ function renderLobby(){
   }
   renderLobbyActions();
 }
+// Host taps two other seats to swap their occupants (and thus their teams).
+function lobbyPickSeat(seat){
+  const p=S.pub; if(!p||S.seat!==p.hostSeat||p.config.teamMode!=='manual') return;
+  if(seat===p.hostSeat) return;
+  if(lobbySwapSel==null){ lobbySwapSel=seat; renderLobby(); return; }
+  if(lobbySwapSel===seat){ lobbySwapSel=null; renderLobby(); return; } // deselect
+  sendRaw({cmd:'swapSeats', seatA:lobbySwapSel, seatB:seat});
+  lobbySwapSel=null;
+}
 function renderLobbyActions(){
   const p=S.pub, host=(S.seat===p.hostSeat);
   const bar=document.getElementById('lobby-actions'); bar.innerHTML='';
   const filled=p.seats.every(s=>!s.empty);
-  if(p.config.teamMode==='manual'){
-    const b=document.createElement('button'); b.textContent='Switch my team'; b.onclick=()=>sendRaw({cmd:'setTeam',team:1-myTeam()});
-    bar.appendChild(b);
-  }
   if(host){
     const addB=document.createElement('button'); addB.textContent='+ Add bot'; addB.onclick=()=>sendRaw({cmd:'addBot'});
     addB.disabled=filled; bar.appendChild(addB);
@@ -499,7 +503,6 @@ function renderGame(){
   renderActionButtons();
   renderHand();
   syncModals();
-  startTimerLoop();
 }
 
 function renderSeats(){
@@ -795,18 +798,9 @@ function flyCard(fromSeat, toSeat, cardId, got){
 function seatAnchor(i){ if(i===S.seat) return document.getElementById('hand')||document.getElementById('meAv'); return document.getElementById('seat-'+i); }
 
 // ============================ Timers ============================
-let timerRAF=null;
-function startTimerLoop(){ if(timerRAF) return; const tick=()=>{ updateTimers(); timerRAF=requestAnimationFrame(tick); }; timerRAF=requestAnimationFrame(tick); }
-function updateTimers(){
-  const p=S.pub; if(!p){ return; }
-  const ring=document.getElementById('timerRing');
-  let txt='';
-  if(p.declaration){ txt='Declaration: '+fmt(p.declaration.deadlineAt); const wt=document.getElementById('waitTimer'); if(wt) wt.textContent=fmt(p.declaration.deadlineAt)+' left'; }
-  else if(p.pause){ txt='Auto-resume in '+fmt(p.pause.deadlineAt); }
-  else if(p.turnDeadlineAt){ txt='Turn: '+fmt(p.turnDeadlineAt); }
-  if(ring) ring.textContent=txt;
-}
-function fmt(deadline){ const ms=Math.max(0,deadline-Date.now()); const s=Math.ceil(ms/1000); const m=Math.floor(s/60); return m>0?(m+':'+String(s%60).padStart(2,'0')):(s+'s'); }
+// This build has no player-facing timers. The server keeps invisible safety
+// caps (an abandoned declaration auto-cancels; a Wait/Stop pause auto-resumes)
+// but no countdown is ever shown, and turns are never timed.
 
 // ============================ Modal helpers ============================
 function modal(title, sub, bodyHtml, actions){
