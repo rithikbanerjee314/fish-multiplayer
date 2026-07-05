@@ -1029,9 +1029,39 @@ function deferCleanup(room) {
 }
 
 // ---------------------------------------------------------------------------
+// Test-only hook (inert unless FISH_TEST=1). Lets headless tests overwrite the
+// live position deterministically so hard-to-reach paths (e.g. the endgame
+// chooseFinalDeclarer) can be forced instead of waited-for. Never enabled in a
+// normal deploy.
+// ---------------------------------------------------------------------------
+function handleTestSetup(ws, msg) {
+  if (process.env.FISH_TEST !== '1') { sendError(ws, 'NO_TEST', 'Test hook disabled.'); return; }
+  const meta = sockets.get(ws); if (!meta) return;
+  const room = rooms.get(meta.code); if (!room) return;
+  clearTimer(room, 'turn'); clearTimer(room, 'decl'); clearTimer(room, 'pause');
+  for (const k in room.botTimers) { if (room.botTimers[k]) clearTimeout(room.botTimers[k]); }
+  room.botTimers = {};
+  room.status = 'playing';
+  const hands = Array.isArray(msg.hands) ? msg.hands : [];
+  for (let i = 0; i < room.seats.length; i++) {
+    if (room.seats[i]) room.seats[i].hand = sortHand((hands[i] || []).slice());
+  }
+  room.claimed = { 0: (msg.claimed && msg.claimed[0]) || [], 1: (msg.claimed && msg.claimed[1]) || [] };
+  room.declaration = null; room.pause = null; room.pendingPass = null; room.pendingFinalChooser = null;
+  room.lastQuestion = null; room.winner = null;
+  room.knowledge = freshKnowledge();
+  if (typeof msg.turnSeat === 'number') room.turnSeat = msg.turnSeat;
+  room.endgame = (teamCardTotal(room, 0) === 0 || teamCardTotal(room, 1) === 0);
+  send(ws, { type: 'testReady' });
+  sendStates(room);
+  scheduleBotIfNeeded(room);
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 const HANDLERS = {
+  __test_setup: handleTestSetup,
   create: handleCreate,
   join: handleJoin,
   reconnect: handleReconnect,

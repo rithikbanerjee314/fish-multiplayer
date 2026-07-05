@@ -1,5 +1,5 @@
 server.js
-test_harness.js
+test_*.js
 node_modules
 package-lock.json
 package.json

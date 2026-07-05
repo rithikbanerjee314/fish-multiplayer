@@ -130,9 +130,19 @@ disconnected human past the grace window.
 Headless Node WS harnesses (run against a local `node server.js`):
 
 ```
-node test_harness.js 6   # full 6p game loop, asserts all 9 sets accounted for
-node test_harness.js 8   # full 8p game loop, asserts all 8 sets accounted for
-node test_edge.js        # reconnect restores seat+hand; wrong declaration → opponents
+node test_harness.js 6      # full 6p game loop, asserts all 9 sets accounted for
+node test_harness.js 8      # full 8p game loop, asserts all 8 sets accounted for
+node test_edge.js           # reconnect restores seat+hand; wrong declaration → opponents
+node test_refresh_decl.js   # two humans: refresh mid-declaration recovers & resolves
 ```
 
-`test_harness.js` is excluded from the Vercel deploy.
+Two tests need the deterministic test hook, so start the server with it enabled
+(`FISH_TEST=1 node server.js`) — the `__test_setup` cmd is inert otherwise:
+
+```
+node test_final_declarer.js # forces a whole-team-out endgame; asserts the
+                            # pendingFinalChooser → chooseFinalDeclarer path
+```
+
+The `test_*.js` harnesses (and the `FISH_TEST` hook, which is off in prod) are
+excluded from the Vercel deploy.
