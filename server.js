@@ -207,11 +207,13 @@ function clearTimer(room, key) {
 // ---------------------------------------------------------------------------
 // Lobby handlers
 // ---------------------------------------------------------------------------
-function makeRoom(teamMode) {
+function makeRoom() {
   return {
     code: generateCode(),
     status: 'lobby',
-    config: { playerCount: PLAYER_COUNT, teamMode, mode: '6', declMs: DECL_MS },
+    // teamMode is always 'manual': the host always arranges teams (there is no
+    // random-assign option).
+    config: { playerCount: PLAYER_COUNT, teamMode: 'manual', mode: '6', declMs: DECL_MS },
     hostSeat: 0,
     seats: emptySeats(PLAYER_COUNT),
     dealerSeat: null,
@@ -244,9 +246,8 @@ function firstFreeSeat(room, parity) {
 }
 
 function handleCreate(ws, msg) {
-  const teamMode = msg.teamMode === 'manual' ? 'manual' : 'random';
   const name = sanitizeName(msg.name) || 'Player 1';
-  const room = makeRoom(teamMode);
+  const room = makeRoom();
   const token = generateToken();
   room.seats[0] = { name, token, socket: ws, isBot: false, connected: true, hand: [] };
   room.hostSeat = 0;
@@ -289,7 +290,6 @@ function requireHost(ws, room) {
 function handleSwapSeats(ws, msg) {
   const meta = sockets.get(ws); if (!meta) return;
   const room = rooms.get(meta.code); if (!room || room.status !== 'lobby') return;
-  if (room.config.teamMode !== 'manual') { sendError(ws, 'NO_MANUAL', 'Teams are auto-assigned in this room.'); return; }
   if (!requireHost(ws, room)) { sendError(ws, 'NOT_HOST', 'Only the host can change teams.'); return; }
   const a = msg.seatA, b = msg.seatB;
   const n = room.seats.length;
@@ -353,23 +353,8 @@ function handleStartGame(ws) {
 // Deal & start
 // ---------------------------------------------------------------------------
 function dealAndStart(room) {
-  // Random team mode shuffles occupants across all seats (team = seat parity),
-  // so teams come out random. Manual mode keeps seats as assigned.
-  if (room.config.teamMode === 'random') {
-    const occupants = room.seats.filter(Boolean);
-    for (let i = occupants.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [occupants[i], occupants[j]] = [occupants[j], occupants[i]];
-    }
-    room.seats = occupants;
-    // re-point sockets to new seats
-    for (let i = 0; i < room.seats.length; i++) {
-      const s = room.seats[i];
-      if (s && s.socket) { const m = sockets.get(s.socket); if (m) m.seat = i; }
-    }
-    reassignHostIfNeeded(room);
-  }
-
+  // Seats (and therefore teams — team = seat parity) are exactly as the host
+  // arranged them in the lobby; dealing never reshuffles who sits where.
   const deck = buildDeck(room.config.mode);
   for (let i = deck.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -391,7 +376,7 @@ function dealAndStart(room) {
   room.knowledge = freshKnowledge();
   room.asksSinceDeclare = 0;
 
-  // Seats may have changed (random team shuffle). Tell every connected human its
+  // The host may have swapped seats in the lobby. Tell every connected human its
   // current seat so the client adopts it before receiving state (otherwise the
   // client ignores its own privateState and never sees its hand or its turn).
   for (let i = 0; i < room.seats.length; i++) {

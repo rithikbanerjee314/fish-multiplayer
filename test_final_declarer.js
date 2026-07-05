@@ -18,7 +18,7 @@ const log = (...a) => console.log('[final]', ...a);
 let pass = true;
 function check(cond, label) { log((cond ? 'PASS' : 'FAIL') + ': ' + label); if (!cond) pass = false; }
 
-// Rigged 6-player position (manual teams → no shuffle, host stays seat 0).
+// Rigged 6-player position (teams are never shuffled; host stays seat 0).
 // Team 0 = seats 0,2,4 hold all of S_LOW; team 1 = seats 1,3,5 hold all of H_LOW.
 // Seven other sets are pre-claimed by team 0. Turn starts on seat 0 (a human).
 const HANDS = [
@@ -42,7 +42,7 @@ let botsAdded = false;
 let turnAfterChoose = null;
 
 const ws = new WebSocket(URL);
-ws.on('open', () => send({ cmd: 'create', name: 'Host', playerCount: 6, teamMode: 'manual', turnTimerSec: 0 }));
+ws.on('open', () => send({ cmd: 'create', name: 'Host' }));
 ws.on('message', raw => { let m; try { m = JSON.parse(raw); } catch (_) { return; } onMsg(m); });
 ws.on('error', e => log('WS error', e.message));
 function send(o) { ws.send(JSON.stringify(o)); }

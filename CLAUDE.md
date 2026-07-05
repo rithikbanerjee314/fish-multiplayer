@@ -43,11 +43,11 @@ and never diverge optimistically — they reconcile from the next `publicState`.
 
 ### Teams & seating
 - `team = seatIndex % 2` (alternating seating, enforced server-side).
-- Host picks **random** (balanced auto-assign) or **manual**. In manual mode
-  **only the host** arranges teams, by swapping two seats (`swapSeats` in lobby).
-  The host can never move their own seat (their team is fixed) and can swap any
-  two *other* seats — including swapping two joined players or moving a player
-  into an open seat on the other team. Non-hosts cannot change anyone's team.
+- There is no random-assign option. **Only the host** arranges teams, by
+  swapping two seats (`swapSeats` in lobby). The host can never move their own
+  seat (their team is fixed) and can swap any two *other* seats — including
+  swapping two joined players or moving a player into an open seat on the
+  other team. Non-hosts cannot change anyone's team.
 
 ## State model
 
@@ -80,10 +80,10 @@ Dispatched through the `HANDLERS` table in `server.js`.
 `privateState` (own hand), `dealt`, `askResult`, `declarationResult` (full
 reveal for animation), `gameOver`, `playerDisconnected`, `error`.
 
-> Note: on deal, seats may be reshuffled (random teams), so the server re-sends
-> `created` with each connected player's **current** seat *before* broadcasting
-> state — otherwise the client would keep a stale seat and ignore its own
-> `privateState`.
+> Note: the host may swap seats in the lobby right up until start, so on deal
+> the server re-sends `created` with each connected player's **current** seat
+> *before* broadcasting state — otherwise the client would keep a stale seat
+> and ignore its own `privateState`.
 
 ## Rules in effect (per spec)
 

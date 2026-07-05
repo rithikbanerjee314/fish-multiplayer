@@ -49,9 +49,6 @@ input:focus,select:focus{border-color:var(--gold)}
 .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
 .row{display:flex;gap:10px}
 .row>*{flex:1}
-.seg{display:flex;gap:6px}
-.seg button{flex:1;padding:9px}
-.seg button.sel{background:var(--gold);color:#1a1208;border-color:var(--gold);font-weight:600}
 .err{color:var(--bad);font-size:13px;margin-top:10px;min-height:18px}
 .codebox{letter-spacing:6px;font-size:22px;text-align:center;font-weight:600}
 
@@ -244,13 +241,7 @@ input:focus,select:focus{border-color:var(--gold)}
 
     <div id="pane-create">
       <div class="field"><label>Your name</label><input id="c-name" maxlength="16" placeholder="e.g. Alex"></div>
-      <div class="field"><label>Teams</label>
-        <div class="seg" id="c-team">
-          <button data-v="random" class="sel">Random</button>
-          <button data-v="manual">Choose in lobby</button>
-        </div>
-      </div>
-      <div class="mini" style="color:var(--muted);font-size:12px;margin-bottom:14px">6 players · fill empty seats with bots in the lobby</div>
+      <div class="mini" style="color:var(--muted);font-size:12px;margin-bottom:14px">6 players · you arrange teams in the lobby · fill empty seats with bots</div>
       <button class="primary" style="width:100%" onclick="doCreate()">Create &amp; open lobby</button>
       <div class="err" id="c-err"></div>
     </div>
@@ -388,21 +379,12 @@ function showTab(t){
   document.getElementById('pane-create').classList.toggle('hidden',t!=='create');
   document.getElementById('pane-join').classList.toggle('hidden',t==='create');
 }
-function segWire(id){
-  const el=document.getElementById(id);
-  el.querySelectorAll('button').forEach(b=>b.onclick=()=>{
-    el.querySelectorAll('button').forEach(x=>x.classList.remove('sel')); b.classList.add('sel');
-  });
-}
-function segVal(id){ const b=document.querySelector('#'+id+' button.sel'); return b?b.dataset.v:null; }
-['c-team'].forEach(segWire);
-
 function doCreate(){
   const name=document.getElementById('c-name').value.trim();
   if(!name){ setText('c-err','Enter your name.'); return; }
   setText('c-err','');
   clearSession();
-  sendRaw({cmd:'create', name, teamMode:segVal('c-team')});
+  sendRaw({cmd:'create', name});
 }
 function doJoin(){
   const name=document.getElementById('j-name').value.trim();
@@ -432,12 +414,12 @@ function seatName(i){ const s=S.pub&&S.pub.seats[i]; return s? (s.name|| (s.empt
 let lobbySwapSel=null; // seat the host picked as the first half of a swap
 function renderLobby(){
   const p=S.pub, host=(S.seat===p.hostSeat);
-  const canArrange = host && p.config.teamMode==='manual';
+  const canArrange = host; // the host always arranges teams — no random option
   if(lobbySwapSel===p.hostSeat) lobbySwapSel=null; // host can never be swapped
   setText('lobby-code', p.code);
   const human=p.seats.filter(s=>!s.empty&&!s.isBot).length;
-  let sub=p.config.playerCount+' players · teams '+(p.config.teamMode)+' · '+human+' joined';
-  if(canArrange) sub+=' · tap two seats to swap their teams';
+  let sub=p.config.playerCount+' players · '+human+' joined';
+  sub+=canArrange? ' · tap two seats to swap their teams' : ' · the host arranges teams';
   setText('lobby-sub', sub);
   for(const t of [0,1]){
     const wrap=document.querySelector('#team'+t+' .seats'); wrap.innerHTML='';
@@ -460,7 +442,7 @@ function renderLobby(){
 }
 // Host taps two other seats to swap their occupants (and thus their teams).
 function lobbyPickSeat(seat){
-  const p=S.pub; if(!p||S.seat!==p.hostSeat||p.config.teamMode!=='manual') return;
+  const p=S.pub; if(!p||S.seat!==p.hostSeat) return;
   if(seat===p.hostSeat) return;
   if(lobbySwapSel==null){ lobbySwapSel=seat; renderLobby(); return; }
   if(lobbySwapSel===seat){ lobbySwapSel=null; renderLobby(); return; } // deselect

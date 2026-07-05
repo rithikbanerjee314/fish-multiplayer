@@ -12,12 +12,12 @@ const log = (...a) => console.log('[edge]', ...a);
 let pass = true;
 function check(cond, label) { log((cond ? 'PASS' : 'FAIL') + ': ' + label); if (!cond) pass = false; }
 
-// Open one host socket, create a manual-team 6p room so seats DON'T shuffle
-// (keeps the host at seat 0 — deterministic for the reconnect assertion).
+// Open one host socket, create a 6p room (seats never shuffle — the host
+// stays at seat 0, deterministic for the reconnect assertion).
 let code = null, token = null, seat = null, hand = [], pub = null;
 let phase = 'lobby';
 const host = new WebSocket(URL);
-host.on('open', () => send(host, { cmd: 'create', name: 'Host', playerCount: 6, teamMode: 'manual', turnTimerSec: 0 }));
+host.on('open', () => send(host, { cmd: 'create', name: 'Host' }));
 host.on('message', raw => onHost(JSON.parse(raw)));
 host.on('error', e => { log('host WS error', e.message); });
 

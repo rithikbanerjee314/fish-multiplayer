@@ -19,7 +19,7 @@ const MAX_ACTIONS = 2000;
 const ws = new WebSocket(URL);
 ws.on('open', () => {
   log('connected; creating ' + MODE + '-player room');
-  send({ cmd: 'create', name: 'Tester', teamMode: 'random' });
+  send({ cmd: 'create', name: 'Tester' });
 });
 ws.on('message', (raw) => { let m; try { m = JSON.parse(raw); } catch (_) { return; } onMsg(m); });
 ws.on('close', () => log('socket closed'));

@@ -26,7 +26,7 @@ let aStarted = false, declStarted = false, refreshed = false, targetSet = null;
 let seatB = null, bSawDeclaration = false;
 
 const A = new WebSocket(URL);
-A.on('open', () => sendTo(A, { cmd: 'create', name: 'Alice', playerCount: 6, teamMode: 'manual', turnTimerSec: 0 }));
+A.on('open', () => sendTo(A, { cmd: 'create', name: 'Alice' }));
 A.on('message', raw => { let m; try { m = JSON.parse(raw); } catch (_) { return; } onA(m); });
 A.on('error', e => log('A WS error', e.message));
 
