@@ -2,5 +2,9 @@
   "buildCommand": null,
   "outputDirectory": null,
   "framework": null,
-  "installCommand": null
+  "installCommand": null,
+  "rewrites": [
+    { "source": "/room/:code", "destination": "/fish.html" },
+    { "source": "/replay/:id", "destination": "/fish.html" }
+  ]
 }

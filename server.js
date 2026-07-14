@@ -177,6 +177,7 @@ function publicStateMsg(room) {
     pendingPass: room.pendingPass ? { seat: room.pendingPass.seat } : null,
     pendingFinalChooser: room.pendingFinalChooser ? { seat: room.pendingFinalChooser.seat } : null,
     winner: room.winner,
+    replayId: room.replayId || null,
   };
 }
 
@@ -233,6 +234,7 @@ function makeRoom() {
     disconnectTimers: {},
     createdAt: Date.now(),
     finishedExpiryHandle: null,
+    log: [], // public event log for this game (ask/declare/start/end) — see storeReplay()
   };
 }
 
@@ -375,6 +377,10 @@ function dealAndStart(room) {
   room.endgame = false; room.winner = null;
   room.knowledge = freshKnowledge();
   room.asksSinceDeclare = 0;
+  room.log = [{
+    type: 'start', dealerSeat: room.dealerSeat,
+    roster: room.seats.map((s, i) => ({ seat: i, name: s.name, team: teamOf(i), isBot: s.isBot })),
+  }];
 
   // The host may have swapped seats in the lobby. Tell every connected human its
   // current seat so the client adopts it before receiving state (otherwise the
@@ -474,6 +480,7 @@ function applyAsk(room, askerSeat, targetSeat, cardId) {
   recordAsk(room, askerSeat, targetSeat, cardId, got);
   room.asksSinceDeclare = (room.asksSinceDeclare || 0) + 1;
   room.lastQuestion = { askerSeat, targetSeat, cardId, result: got ? 'got' : 'denied' };
+  room.log.push({ type: 'ask', askerSeat, targetSeat, cardId, got });
   broadcast(room, {
     type: 'askResult', askerSeat, targetSeat, cardId, got,
   });
@@ -581,6 +588,7 @@ function resolveDeclaration(room, declarerSeat, hsId, assignments) {
   clearTimer(room, 'decl');
   room.declaration = null;
 
+  room.log.push({ type: 'declare', hsId, declarerSeat, success: correct, winnerTeam: winner, reveal });
   broadcast(room, {
     type: 'declarationResult',
     hsId, declarerSeat, success: correct, winnerTeam: winner, reveal,
@@ -682,8 +690,10 @@ function finishGame(room) {
   room.botTimers = {};
   const a = room.claimed[0].length, b = room.claimed[1].length;
   room.winner = a > b ? 0 : (b > a ? 1 : 'tie');
+  room.log.push({ type: 'end', winner: room.winner, score: { 0: a, 1: b } });
+  room.replayId = storeReplay(room);
   broadcast(room, publicStateMsg(room));
-  broadcast(room, { type: 'gameOver', winner: room.winner, score: { 0: a, 1: b } });
+  broadcast(room, { type: 'gameOver', winner: room.winner, score: { 0: a, 1: b }, replayId: room.replayId });
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +994,30 @@ function handleClose(ws) {
   if (!anyHuman) deferCleanup(room);
 }
 
+// ---------------------------------------------------------------------------
+// Replays — finished games' public event logs, kept independently of the live
+// room so they survive lobby GC. In-memory only (same "lost on restart"
+// tradeoff as room state); capped FIFO so a long-running server can't leak.
+// ---------------------------------------------------------------------------
+const replays = new Map(); // id -> { id, code, roster, log, score, winner, halfSuits, finishedAt }
+const REPLAY_CAP = 200;
+
+function storeReplay(room) {
+  const id = crypto.randomBytes(4).toString('hex');
+  replays.set(id, {
+    id,
+    code: room.code,
+    roster: room.seats.map((s, i) => ({ seat: i, name: s ? s.name : null, team: teamOf(i), isBot: s ? s.isBot : false })),
+    log: room.log,
+    score: { 0: room.claimed[0].length, 1: room.claimed[1].length },
+    winner: room.winner,
+    halfSuits: allHalfSuits(room.config.mode),
+    finishedAt: Date.now(),
+  });
+  if (replays.size > REPLAY_CAP) replays.delete(replays.keys().next().value);
+  return id;
+}
+
 function cleanupRoom(room) {
   clearTimer(room, 'decl'); clearTimer(room, 'pause');
   for (const k in room.botTimers) if (room.botTimers[k]) clearTimeout(room.botTimers[k]);
@@ -1056,7 +1090,15 @@ const FISH_HTML = path.join(__dirname, 'fish.html');
 
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/healthz') { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('ok'); return; }
-  // Serve the single-page app at / (and any non-API path).
+  const replayMatch = req.url.match(/^\/api\/replay\/([a-f0-9]+)$/);
+  if (replayMatch) {
+    const r = replays.get(replayMatch[1]);
+    res.writeHead(r ? 200 : 404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(r || { error: 'NOT_FOUND' }));
+    return;
+  }
+  // Serve the single-page app at / and any other page path (/room/:code,
+  // /replay/:id, etc.) — routing for those lives client-side.
   fs.readFile(FISH_HTML, (err, data) => {
     if (err) {
       res.writeHead(200, { 'Content-Type': 'text/plain' });

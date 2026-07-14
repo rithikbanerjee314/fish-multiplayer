@@ -206,6 +206,27 @@ input:focus,select:focus{border-color:var(--gold)}
 /* gameover */
 .go-team{font-size:clamp(26px,6vw,46px);font-weight:800;margin:6px 0}
 .go-score{font-size:20px;color:var(--muted);margin-bottom:16px}
+.go-actions{display:flex;gap:10px;justify-content:center;margin-top:10px;flex-wrap:wrap}
+
+/* replay */
+#replay{align-items:center;overflow:auto;padding:22px}
+.replay-wrap{width:min(720px,96vw);background:var(--panel);border:1px solid var(--line);border-radius:18px;
+  box-shadow:var(--shadow);padding:22px;margin:auto}
+.replay-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px}
+.replay-roster{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+.replay-roster .col{background:var(--bg2);border-radius:12px;padding:10px 12px;border-top:3px solid var(--t0)}
+.replay-roster .col.t1{border-top-color:var(--t1)}
+.replay-roster .col h4{margin:0 0 6px;font-size:13px}
+.replay-roster .col div{font-size:13px;color:var(--muted)}
+.replay-scrub{display:flex;align-items:center;gap:10px;margin:14px 0}
+.replay-scrub input[type=range]{flex:1}
+.replay-event{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:14px;min-height:60px;
+  font-size:14px;line-height:1.5}
+.replay-event .got{color:var(--good)} .replay-event .no{color:var(--bad)}
+.replay-log{max-height:260px;overflow:auto;margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+.replay-log .row{font-size:12px;color:var(--muted);padding:4px 6px;border-radius:6px;cursor:pointer}
+.replay-log .row:hover{background:var(--panel2)}
+.replay-log .row.cur{background:var(--panel2);color:var(--ink);outline:1px solid var(--gold)}
 
 /* responsive */
 @media(max-width:720px){
@@ -309,6 +330,25 @@ input:focus,select:focus{border-color:var(--gold)}
   </div>
 </div>
 
+<!-- REPLAY -->
+<div id="replay" class="screen hidden">
+  <div class="replay-wrap">
+    <div class="replay-head">
+      <div><h2 style="margin:0">Replay</h2><div class="mini" id="replay-sub" style="color:var(--muted);font-size:13px"></div></div>
+      <div class="code-chip" id="replay-code">----</div>
+    </div>
+    <div class="replay-roster" id="replay-roster"></div>
+    <div class="replay-event" id="replay-eventbox"></div>
+    <div class="replay-scrub">
+      <button id="replay-prev" onclick="stepReplay(-1)">◀ Prev</button>
+      <input type="range" id="replay-range" min="0" value="0" oninput="setReplayIdx(this.value)">
+      <button id="replay-next" onclick="stepReplay(1)">Next ▶</button>
+    </div>
+    <div class="lobby-actions"><button class="primary" onclick="backToMenu()">Back to menu</button></div>
+    <div class="replay-log" id="replay-log"></div>
+  </div>
+</div>
+
 <script>
 'use strict';
 // ============================ Config / connection ============================
@@ -319,11 +359,37 @@ function wsUrl(){
   if(PROD_WS_URL) return PROD_WS_URL;
   return (location.protocol==='https:'?'wss://':'ws://')+location.host;
 }
+// Same backend-selection logic as wsUrl(), for plain HTTP (the replay fetch).
+// Needed because on the static Vercel deploy the page's own origin has no
+// server.js behind it — the API lives wherever the WS connection points.
+function apiBase(){
+  const h=location.hostname;
+  if(!h||h==='localhost'||h==='127.0.0.1') return 'http://localhost:8080';
+  if(PROD_WS_URL) return PROD_WS_URL.replace(/^wss:/,'https:').replace(/^ws:/,'http:');
+  return location.protocol+'//'+location.host;
+}
 const SUIT_SYM={S:'♠',H:'♥',D:'♦',C:'♣'};
 const RED=new Set(['H','D']);
 
 const S={ ws:null, code:null, token:null, seat:null, pub:null, hand:[], connected:false,
   retry:0, lastSeats:null, declModalOpen:false, leftGame:false };
+const R={ data:null, idx:0 }; // replay viewer state
+
+// ============================ Routing (deep links) ============================
+// /room/ABCD pre-fills the join form (session-based reconnect still takes
+// priority — this only shapes what the landing screen shows). /replay/<id>
+// fetches and renders a finished game's log instead of connecting to play.
+function initRouting(){
+  const roomM=location.pathname.match(/^\/room\/([A-Za-z0-9]{4})$/);
+  if(roomM){
+    showTab('join');
+    const inp=document.getElementById('j-code');
+    if(inp) inp.value=roomM[1].toUpperCase();
+  }
+  const replayM=location.pathname.match(/^\/replay\/([a-f0-9]+)$/i);
+  if(replayM) loadReplay(replayM[1]);
+}
+function backToMenu(){ location.href='/'; }
 
 // ============================ WebSocket ============================
 function connect(){
@@ -349,7 +415,8 @@ function clearSession(){ try{sessionStorage.removeItem('fish');}catch(_){} }
 // ============================ Message dispatch ============================
 function onMessage(m){
   switch(m.type){
-    case 'created': S.code=m.code; S.token=m.token; S.seat=m.seat; saveSession(); break;
+    case 'created': S.code=m.code; S.token=m.token; S.seat=m.seat; saveSession();
+      history.replaceState(null,'','/room/'+m.code); break;
     case 'publicState': S.pub=m; render(); break;
     case 'privateState': if(m.seat===S.seat){ S.hand=m.hand; renderHand(); } break;
     case 'dealt': sfx('deal'); toast('Cards dealt — '+seatName(m.dealerSeat)+' goes first','gold'); break;
@@ -399,6 +466,7 @@ function doJoin(){
 // ============================ Rendering ============================
 function render(){
   if(!S.pub) return;
+  document.getElementById('replay').classList.add('hidden');
   const st=S.pub.status;
   document.getElementById('landing').classList.toggle('hidden', true);
   document.getElementById('lobby').classList.toggle('hidden', st!=='lobby');
@@ -527,7 +595,7 @@ function renderPiles(){
 function renderTurnInfo(){
   const p=S.pub;
   const tb=document.getElementById('turnBanner'), lq=document.getElementById('lastQ');
-  if(p.status==='finished'){ tb.textContent=''; }
+  if(p.status==='finished'){ tb.innerHTML = p.replayId ? '<a href="/replay/'+p.replayId+'" style="color:var(--gold2)">View replay</a>' : ''; }
   else if(p.pendingPass){ tb.innerHTML = p.pendingPass.seat===S.seat? 'Choose a teammate to take the turn' : seatName(p.pendingPass.seat)+' is passing the turn…'; }
   else if(p.pendingFinalChooser){ tb.innerHTML = p.pendingFinalChooser.seat===S.seat? '<span style="color:var(--gold2)">Your team is out — choose an opponent to declare</span>' : seatName(p.pendingFinalChooser.seat)+' is choosing who declares the rest…'; }
   else if(p.pause){ tb.innerHTML='Paused by '+seatName(p.pause.bySeat); }
@@ -721,7 +789,7 @@ function doChooseFinal(i){ sendRaw({cmd:'chooseFinalDeclarer',toSeat:i}); closeM
 
 // ============================ Pause / leave ============================
 function togglePause(){ const p=S.pub; if(p.pause&&p.pause.bySeat===S.seat) sendRaw({cmd:'resume'}); else if(!p.pause) sendRaw({cmd:'pause'}); }
-function leaveGame(){ if(!confirm('Leave this game?'))return; S.leftGame=true; clearSession(); try{S.ws.close();}catch(_){} location.reload(); }
+function leaveGame(){ if(!confirm('Leave this game?'))return; S.leftGame=true; clearSession(); try{S.ws.close();}catch(_){} backToMenu(); }
 
 // ============================ Events: ask / declare / gameover ============================
 function onAskResult(m){
@@ -751,10 +819,87 @@ function onGameOver(m){
   let title, cls;
   if(m.winner==='tie'){ title='It\'s a tie!'; cls=''; }
   else { const mine=(m.winner===myTeam()); title=(m.winner===0?'Team A':'Team B')+' wins'+(mine?' — that\'s you!':''); cls=mine?'good':'bad'; sfx(mine?'win':'lose'); }
+  const replayLink = m.replayId ? '<button class="ghost" onclick="location.href=\'/replay/'+m.replayId+'\'">View replay</button>' : '';
   modalRaw('<div style="text-align:center"><div class="sub">Final result</div>'+
     '<div class="go-team '+(m.winner==='tie'?'':(m.winner===0?'':''))+'" style="color:'+(m.winner==='tie'?'var(--gold2)':(m.winner===0?'var(--t0b)':'var(--t1b)'))+'">'+esc(title)+'</div>'+
     '<div class="go-score">Team A '+m.score[0]+' — '+m.score[1]+' Team B</div>'+
-    '<button class="primary" onclick="location.reload()">Back to menu</button></div>', false);
+    '<div class="go-actions">'+replayLink+'<button class="primary" onclick="backToMenu()">Back to menu</button></div></div>', false);
+}
+
+// ============================ Replay viewer ============================
+function loadReplay(id){
+  fetch(apiBase()+'/api/replay/'+id).then(r=>{
+    if(!r.ok) throw new Error('not found');
+    return r.json();
+  }).then(renderReplay).catch(()=>{ toast('Replay not found or expired','bad'); });
+}
+function replayRosterName(seat){
+  const r=R.data && R.data.roster.find(x=>x.seat===seat);
+  return r ? (r.name||('Player '+(seat+1))) : 'Player '+(seat+1);
+}
+function renderReplay(data){
+  R.data=data; R.idx=data.log.length;
+  document.getElementById('landing').classList.add('hidden');
+  document.getElementById('lobby').classList.add('hidden');
+  document.getElementById('game').style.display='none';
+  document.getElementById('replay').classList.remove('hidden');
+  setText('replay-code', data.code);
+  const winTxt = data.winner==='tie' ? 'Tie game' : ((data.winner===0?'Team A':'Team B')+' won');
+  setText('replay-sub', winTxt+' · '+data.score[0]+'–'+data.score[1]+' · '+new Date(data.finishedAt).toLocaleString());
+  const rw=document.getElementById('replay-roster'); rw.innerHTML='';
+  for(const t of [0,1]){
+    const col=document.createElement('div'); col.className='col'+(t===1?' t1':'');
+    col.innerHTML='<h4>'+(t===0?'Team A':'Team B')+'</h4>'+
+      data.roster.filter(r=>r.team===t).map(r=>'<div>'+esc(r.name||'—')+(r.isBot?' (bot)':'')+'</div>').join('');
+    rw.appendChild(col);
+  }
+  document.getElementById('replay-range').max=data.log.length;
+  renderReplayAt();
+}
+function setReplayIdx(v){ R.idx=Math.max(0,Math.min(R.data.log.length,Number(v))); renderReplayAt(); }
+function stepReplay(delta){ setReplayIdx(R.idx+delta); }
+function renderReplayAt(){
+  const data=R.data; if(!data) return;
+  document.getElementById('replay-range').value=R.idx;
+  document.getElementById('replay-prev').disabled = R.idx<=0;
+  document.getElementById('replay-next').disabled = R.idx>=data.log.length;
+  const entry = R.idx>0 ? data.log[R.idx-1] : null;
+  document.getElementById('replay-eventbox').innerHTML =
+    entry ? replayEventHtml(entry) : '<span style="color:var(--muted)">Move the slider or click a row below to step through the game.</span>';
+  renderReplayLog();
+}
+function replayEventHtml(e){
+  if(e.type==='start') return 'Cards dealt. '+esc(replayRosterName(e.dealerSeat))+' goes first.';
+  if(e.type==='ask') return esc(replayRosterName(e.askerSeat))+' asked '+esc(replayRosterName(e.targetSeat))+
+    ' for <b>'+cardText(e.cardId)+'</b> — '+(e.got?'<span class="got">got it</span>':'<span class="no">no</span>');
+  if(e.type==='declare'){
+    const winTeamName=e.winnerTeam===0?'Team A':'Team B';
+    const lines=e.reveal.map(r=>cardText(r.cardId)+' → '+esc(replayRosterName(r.actualSeat))).join(' · ');
+    return '<b>'+esc(replayRosterName(e.declarerSeat))+'</b> declared <b>'+setLabel(e.hsId)+'</b> — '+
+      (e.success?'<span class="got">correct</span>':'<span class="no">wrong</span>')+' → '+winTeamName+
+      '<div style="margin-top:8px;font-size:12px;color:var(--muted)">'+lines+'</div>';
+  }
+  if(e.type==='end'){
+    const t = e.winner==='tie' ? 'Tie game.' : ((e.winner===0?'Team A':'Team B')+' wins '+e.score[0]+'–'+e.score[1]+'.');
+    return '<b>Game over.</b> '+t;
+  }
+  return '';
+}
+function replayLogLine(e){
+  if(e.type==='start') return 'Deal — '+replayRosterName(e.dealerSeat)+' starts';
+  if(e.type==='ask') return replayRosterName(e.askerSeat)+' → '+replayRosterName(e.targetSeat)+' ('+cardText(e.cardId)+') '+(e.got?'✓':'✗');
+  if(e.type==='declare') return replayRosterName(e.declarerSeat)+' declares '+setLabel(e.hsId)+' '+(e.success?'✓':'✗');
+  if(e.type==='end') return 'Game over';
+  return e.type;
+}
+function renderReplayLog(){
+  const data=R.data, wrap=document.getElementById('replay-log'); wrap.innerHTML='';
+  data.log.forEach((e,i)=>{
+    const row=document.createElement('div'); row.className='row'+(i+1===R.idx?' cur':'');
+    row.textContent=replayLogLine(e);
+    row.onclick=()=>setReplayIdx(i+1);
+    wrap.appendChild(row);
+  });
 }
 
 // ============================ Flying card animation ============================
@@ -844,6 +989,7 @@ render=function(){ _origRender(); const p=S.pub; if(p&&p.status==='playing'){ co
 document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ const o=document.getElementById('overlay'); if(o&&o._dismissable) closeModal(); } });
 
 // ============================ boot ============================
+initRouting();
 connect();
 </script>
 </body>
