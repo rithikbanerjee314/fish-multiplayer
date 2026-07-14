@@ -352,7 +352,7 @@ input:focus,select:focus{border-color:var(--gold)}
 <script>
 'use strict';
 // ============================ Config / connection ============================
-const PROD_WS_URL = ''; // ← set to your Render wss:// URL only if hosting the page elsewhere (e.g. Vercel)
+const PROD_WS_URL = 'wss://fish-multiplayer.onrender.com'; // Render backend (used when the page is hosted elsewhere, e.g. Vercel)
 function wsUrl(){
   const h=location.hostname;
   if(!h||h==='localhost'||h==='127.0.0.1') return 'ws://localhost:8080';
